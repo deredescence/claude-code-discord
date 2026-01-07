@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.log
+.DS_Store
+Thumbs.db
+
+# Session database
+sessions.db
+sessions.db-journal
+
+# IDE
+.vscode/
+.idea/

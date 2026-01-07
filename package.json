@@ -1,0 +1,28 @@
+{
+  "name": "claude-code-discord",
+  "version": "1.0.0",
+  "description": "Discord bot wrapper for Claude Code CLI with full feature parity",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "discord",
+    "bot",
+    "ai",
+    "coding",
+    "anthropic"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "better-sqlite3": "^9.4.3",
+    "strip-ansi": "^7.1.0",
+    "dotenv": "^16.4.5"
+  }
+}
