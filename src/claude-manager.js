@@ -1,286 +1,298 @@
 /**
- * Claude Code Process Manager
- * Spawns and manages Claude Code CLI processes
+ * Claude Code Process Manager (PTY Version)
+ *
+ * Uses node-pty for true interactive mode - persistent sessions,
+ * real-time streaming, thinking display, the works.
  */
 
-import { spawn } from 'child_process';
+import pty from 'node-pty';
 import { EventEmitter } from 'events';
-import { cleanOutput, extractSessionId, isWaitingForInput } from './utils/formatter.js';
+import { cleanOutput, isWaitingForInput, isThinking } from './utils/formatter.js';
 
 const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
-const DEFAULT_TIMEOUT = 300000; // 5 minutes
+const SHELL = process.platform === 'win32' ? 'powershell.exe' : 'bash';
 
-export class ClaudeProcess extends EventEmitter {
+/**
+ * Interactive Claude Code session using PTY
+ */
+export class ClaudeSession extends EventEmitter {
     constructor(options = {}) {
         super();
-        this.process = null;
+        this.pty = null;
         this.sessionId = options.sessionId || null;
         this.workingDir = options.workingDir || process.cwd();
         this.isRunning = false;
+        this.isReady = false;
         this.outputBuffer = '';
-        this.timeout = options.timeout || DEFAULT_TIMEOUT;
-        this.timeoutHandle = null;
+        this.pendingResolve = null;
+        this.lastActivity = Date.now();
+
+        // Output buffering for Discord
+        this.discordBuffer = '';
+        this.bufferTimeout = null;
+        this.BUFFER_DELAY = 500; // ms to wait before sending to Discord
     }
 
     /**
-     * Start a new Claude Code session
+     * Start interactive Claude Code session
      */
-    start(initialPrompt = null, options = {}) {
+    start() {
         const args = ['--dangerously-skip-permissions'];
 
-        // Add resume flag if we have a session ID
+        // Resume if we have a session ID
         if (this.sessionId) {
             args.push('--resume', this.sessionId);
         }
 
-        // Add print mode for non-interactive use
-        if (initialPrompt) {
-            args.push('-p', initialPrompt);
-        }
-
-        // Add output format
-        args.push('--output-format', 'text');
-
-        this.process = spawn(CLAUDE_PATH, args, {
+        // Spawn PTY
+        this.pty = pty.spawn(CLAUDE_PATH, args, {
+            name: 'xterm-256color',
+            cols: 120,
+            rows: 40,
             cwd: this.workingDir,
             env: {
                 ...process.env,
-                FORCE_COLOR: '0', // Disable colors for cleaner output
-                NO_COLOR: '1'
-            },
-            shell: true
+                FORCE_COLOR: '1',
+                TERM: 'xterm-256color'
+            }
         });
 
         this.isRunning = true;
         this.setupListeners();
-        this.resetTimeout();
 
         return this;
     }
 
     /**
-     * Send a message to the running Claude process
+     * Send input to Claude
      */
-    send(message) {
-        if (!this.process || !this.isRunning) {
-            throw new Error('Claude process is not running');
+    write(input) {
+        if (!this.pty || !this.isRunning) {
+            throw new Error('Session not running');
         }
 
-        this.resetTimeout();
-        this.process.stdin.write(message + '\n');
+        this.lastActivity = Date.now();
+        this.isReady = false;
+        this.pty.write(input + '\r');
     }
 
     /**
-     * Execute a single prompt and get response
+     * Send a message and wait for response
      */
-    async execute(prompt, options = {}) {
+    async send(message) {
         return new Promise((resolve, reject) => {
-            const args = ['-p', prompt, '--output-format', 'text'];
+            if (!this.isReady && this.isRunning) {
+                // Wait for ready state
+                const readyHandler = () => {
+                    this.removeListener('ready', readyHandler);
+                    this.doSend(message, resolve, reject);
+                };
+                this.once('ready', readyHandler);
 
-            if (this.sessionId) {
-                args.push('--resume', this.sessionId);
-            }
-
-            if (options.continueSession) {
-                args.push('--continue');
-            }
-
-            const proc = spawn(CLAUDE_PATH, args, {
-                cwd: this.workingDir,
-                env: {
-                    ...process.env,
-                    FORCE_COLOR: '0',
-                    NO_COLOR: '1'
-                },
-                shell: true
-            });
-
-            let stdout = '';
-            let stderr = '';
-
-            proc.stdout.on('data', (data) => {
-                const chunk = data.toString();
-                stdout += chunk;
-                this.emit('output', cleanOutput(chunk));
-            });
-
-            proc.stderr.on('data', (data) => {
-                stderr += data.toString();
-            });
-
-            proc.on('close', (code) => {
-                // Try to extract session ID from output
-                const newSessionId = extractSessionId(stdout) || extractSessionId(stderr);
-                if (newSessionId) {
-                    this.sessionId = newSessionId;
-                    this.emit('session', newSessionId);
-                }
-
-                if (code === 0) {
-                    resolve({
-                        output: cleanOutput(stdout),
-                        sessionId: this.sessionId
-                    });
-                } else {
-                    reject(new Error(`Claude exited with code ${code}: ${stderr}`));
-                }
-            });
-
-            proc.on('error', (error) => {
-                reject(error);
-            });
-
-            // Set timeout
-            setTimeout(() => {
-                if (!proc.killed) {
-                    proc.kill();
-                    reject(new Error('Claude process timed out'));
-                }
-            }, this.timeout);
-        });
-    }
-
-    /**
-     * Execute with streaming output
-     */
-    async *executeStream(prompt, options = {}) {
-        const args = ['-p', prompt, '--output-format', 'stream-json'];
-
-        if (this.sessionId) {
-            args.push('--resume', this.sessionId);
-        }
-
-        if (options.continueSession) {
-            args.push('--continue');
-        }
-
-        const proc = spawn(CLAUDE_PATH, args, {
-            cwd: this.workingDir,
-            env: {
-                ...process.env,
-                FORCE_COLOR: '0',
-                NO_COLOR: '1'
-            },
-            shell: true
-        });
-
-        this.process = proc;
-        this.isRunning = true;
-
-        const chunks = [];
-
-        proc.stdout.on('data', (data) => {
-            chunks.push(data.toString());
-        });
-
-        proc.stderr.on('data', (data) => {
-            this.emit('error', data.toString());
-        });
-
-        // Yield chunks as they come in
-        while (this.isRunning || chunks.length > 0) {
-            if (chunks.length > 0) {
-                const chunk = chunks.shift();
-                yield cleanOutput(chunk);
+                // Timeout after 30s
+                setTimeout(() => {
+                    this.removeListener('ready', readyHandler);
+                    reject(new Error('Timeout waiting for Claude to be ready'));
+                }, 30000);
             } else {
-                await new Promise(resolve => setTimeout(resolve, 50));
+                this.doSend(message, resolve, reject);
             }
+        });
+    }
 
-            // Check if process has ended
-            if (proc.exitCode !== null) {
-                this.isRunning = false;
-            }
+    doSend(message, resolve, reject) {
+        this.outputBuffer = '';
+        this.pendingResolve = resolve;
+
+        // Set up response timeout
+        const timeout = setTimeout(() => {
+            this.pendingResolve = null;
+            reject(new Error('Response timeout'));
+        }, 300000); // 5 minute timeout
+
+        // Listen for completion
+        const completeHandler = () => {
+            clearTimeout(timeout);
+            this.pendingResolve = null;
+            this.removeListener('ready', completeHandler);
+            resolve(this.outputBuffer);
+        };
+
+        this.once('ready', completeHandler);
+        this.write(message);
+    }
+
+    /**
+     * Execute a slash command (like /plugin)
+     */
+    async command(cmd) {
+        return this.send(cmd);
+    }
+
+    /**
+     * Resize the PTY (if Discord somehow needs it)
+     */
+    resize(cols, rows) {
+        if (this.pty) {
+            this.pty.resize(cols, rows);
         }
     }
 
     /**
-     * Kill the Claude process
+     * Kill the session
      */
     kill() {
-        if (this.process && !this.process.killed) {
-            this.process.kill('SIGTERM');
+        if (this.pty) {
+            this.pty.kill();
+            this.pty = null;
         }
         this.isRunning = false;
-        this.clearTimeout();
+        this.isReady = false;
+        this.emit('close', 0);
+    }
+
+    /**
+     * Graceful exit - send /exit command first
+     */
+    async exit() {
+        try {
+            this.write('/exit\r');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (e) {
+            // Ignore
+        }
+        this.kill();
     }
 
     setupListeners() {
-        this.process.stdout.on('data', (data) => {
-            const output = data.toString();
-            this.outputBuffer += output;
+        this.pty.onData((data) => {
+            this.lastActivity = Date.now();
+            const cleaned = cleanOutput(data);
 
-            const cleaned = cleanOutput(output);
-            if (cleaned) {
-                this.emit('output', cleaned);
-            }
+            // Accumulate output
+            this.outputBuffer += cleaned;
+
+            // Buffer for Discord (don't spam)
+            this.discordBuffer += cleaned;
+            this.scheduleDiscordEmit();
+
+            // Emit raw for debugging
+            this.emit('data', data);
 
             // Check for session ID in output
-            const sessionId = extractSessionId(output);
-            if (sessionId && !this.sessionId) {
-                this.sessionId = sessionId;
-                this.emit('session', sessionId);
+            const sessionMatch = data.match(/Session:\s*([a-f0-9-]+)/i) ||
+                                 data.match(/session[:\s]+([a-f0-9-]+)/i);
+            if (sessionMatch && !this.sessionId) {
+                this.sessionId = sessionMatch[1];
+                this.emit('session', this.sessionId);
             }
 
-            // Check if waiting for input
-            if (isWaitingForInput(output)) {
+            // Check if Claude is thinking
+            if (isThinking(cleaned)) {
+                this.emit('thinking', cleaned);
+            }
+
+            // Check if ready for input
+            if (isWaitingForInput(data)) {
+                this.isReady = true;
                 this.emit('ready');
+
+                // Flush any remaining buffer
+                if (this.discordBuffer.trim()) {
+                    this.emit('output', this.discordBuffer);
+                    this.discordBuffer = '';
+                }
             }
         });
 
-        this.process.stderr.on('data', (data) => {
-            const error = data.toString();
-            this.emit('error', cleanOutput(error));
-        });
-
-        this.process.on('close', (code) => {
+        this.pty.onExit(({ exitCode }) => {
             this.isRunning = false;
-            this.clearTimeout();
-            this.emit('close', code);
-        });
-
-        this.process.on('error', (error) => {
-            this.isRunning = false;
-            this.clearTimeout();
-            this.emit('error', error.message);
+            this.isReady = false;
+            this.emit('close', exitCode);
         });
     }
 
-    resetTimeout() {
-        this.clearTimeout();
-        this.timeoutHandle = setTimeout(() => {
-            this.emit('timeout');
-            this.kill();
-        }, this.timeout);
+    scheduleDiscordEmit() {
+        // Debounce Discord output
+        if (this.bufferTimeout) {
+            clearTimeout(this.bufferTimeout);
+        }
+
+        this.bufferTimeout = setTimeout(() => {
+            if (this.discordBuffer.trim()) {
+                this.emit('output', this.discordBuffer);
+                this.discordBuffer = '';
+            }
+        }, this.BUFFER_DELAY);
+    }
+}
+
+// Active sessions: channelId_userId -> ClaudeSession
+const activeSessions = new Map();
+
+/**
+ * Get or create a session for a channel/user
+ */
+export function getOrCreateSession(channelId, userId, options = {}) {
+    const key = `${channelId}_${userId}`;
+
+    let session = activeSessions.get(key);
+
+    if (!session || !session.isRunning) {
+        session = new ClaudeSession({
+            sessionId: options.sessionId,
+            workingDir: options.workingDir
+        });
+        session.start();
+        activeSessions.set(key, session);
     }
 
-    clearTimeout() {
-        if (this.timeoutHandle) {
-            clearTimeout(this.timeoutHandle);
-            this.timeoutHandle = null;
+    return session;
+}
+
+/**
+ * Get existing session (don't create)
+ */
+export function getSession(channelId, userId) {
+    return activeSessions.get(`${channelId}_${userId}`);
+}
+
+/**
+ * Kill and remove a session
+ */
+export function killSession(channelId, userId) {
+    const key = `${channelId}_${userId}`;
+    const session = activeSessions.get(key);
+
+    if (session) {
+        session.kill();
+        activeSessions.delete(key);
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Get all active sessions
+ */
+export function getAllSessions() {
+    return activeSessions;
+}
+
+/**
+ * Clean up stale sessions (no activity for > 30 min)
+ */
+export function cleanupStaleSessions() {
+    const STALE_THRESHOLD = 30 * 60 * 1000; // 30 minutes
+    const now = Date.now();
+
+    for (const [key, session] of activeSessions) {
+        if (now - session.lastActivity > STALE_THRESHOLD) {
+            session.kill();
+            activeSessions.delete(key);
         }
     }
 }
 
-// Active processes map: channelId_userId -> ClaudeProcess
-const activeProcesses = new Map();
-
-export function getProcess(channelId, userId) {
-    return activeProcesses.get(`${channelId}_${userId}`);
-}
-
-export function setProcess(channelId, userId, process) {
-    activeProcesses.set(`${channelId}_${userId}`, process);
-}
-
-export function removeProcess(channelId, userId) {
-    const key = `${channelId}_${userId}`;
-    const proc = activeProcesses.get(key);
-    if (proc) {
-        proc.kill();
-        activeProcesses.delete(key);
-    }
-}
-
-export function getAllProcesses() {
-    return activeProcesses;
-}
+// Run cleanup every 5 minutes
+setInterval(cleanupStaleSessions, 5 * 60 * 1000);

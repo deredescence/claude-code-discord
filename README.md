@@ -1,124 +1,127 @@
 # Claude Code Discord Bot
 
-A Discord bot that wraps Claude Code CLI with full feature parity. Chat with Claude Code through Discord - no terminal flickering, works great on mobile.
+A Discord bot that wraps Claude Code CLI with **true interactive mode**. Persistent PTY sessions, real-time streaming, full feature parity. No terminal flickering, works great on mobile.
 
 ## Features
 
-- **Full Claude Code CLI integration** - Not just a workflow trigger, actual Claude Code
-- **Session persistence** - Resume conversations with `--resume` automatically handled
-- **Multi-user support** - Each user gets their own session per channel
-- **File attachments** - Upload files for Claude to analyze
-- **Streaming output** - See Claude's responses as they come in
-- **Slash commands** - Clean Discord-native interface
+- **True Interactive Mode** - Persistent PTY sessions, not separate process spawns
+- **Real-time Streaming** - See Claude's output as it types
+- **Session Persistence** - Automatic `--resume` handling across messages
+- **Multi-user Support** - Each user gets their own session per channel
+- **Direct Message Mode** - Just type in the channel after starting a session
+- **Full Command Support** - Run any Claude Code command (`/help`, `/plugin`, `/config`)
+- **Stale Session Cleanup** - Auto-kills inactive sessions after 30 min
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/claude <prompt>` | Send a message to Claude Code |
-| `/claude-new` | Start a fresh session (clears context) |
-| `/claude-resume [session_id]` | Resume a previous session |
-| `/claude-stop` | Stop the current Claude process |
+| `/claude <message>` | Send a message to Claude Code |
+| `/claude-start [workdir] [resume]` | Start a new session |
+| `/claude-stop` | Stop your current session |
+| `/claude-status` | Check session status |
+| `/claude-command <cmd>` | Run Claude Code commands (e.g., `/plugin`, `/help`) |
 | `/claude-sessions` | List your recent sessions |
-| `/claude-status` | Check current session status |
-
-## Setup
-
-### 1. Create Discord Bot
-
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
-2. Click "New Application" and name it
-3. Go to "Bot" tab, click "Add Bot"
-4. Enable these Privileged Gateway Intents:
-   - Message Content Intent
-5. Copy the Bot Token
-
-### 2. Get Client ID
-
-1. In Developer Portal, go to "OAuth2" tab
-2. Copy the "Client ID"
-
-### 3. Invite Bot to Server
-
-Generate invite URL with these permissions:
-- Send Messages
-- Use Slash Commands
-- Embed Links
-- Attach Files
-- Read Message History
-
-Or use this template:
-```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=277025770560&scope=bot%20applications.commands
-```
-
-### 4. Configure Environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```env
-DISCORD_TOKEN=your_bot_token_here
-DISCORD_CLIENT_ID=your_client_id_here
-DISCORD_GUILD_ID=your_server_id  # Optional, for faster command registration
-CLAUDE_WORKDIR=/path/to/default/workdir  # Optional
-```
-
-### 5. Install & Run
-
-```bash
-npm install
-npm start
-```
 
 ## How It Works
 
 ```
 Discord User
      │
-     ▼
-┌─────────────────┐
-│  Discord Bot    │
-│  (discord.js)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│ Claude Manager  │──▶ Spawns claude CLI processes
-│                 │──▶ Handles stdin/stdout
-└────────┬────────┘──▶ Manages sessions
-         │
-         ▼
-┌─────────────────┐
-│ Session Store   │──▶ SQLite database
-│                 │──▶ Maps channel+user → session
-└─────────────────┘──▶ Stores resume IDs
+     ├── /claude "fix the bug"
+     │         │
+     ▼         ▼
+┌─────────────────────────────────────┐
+│          Discord Bot                │
+│  ┌─────────────────────────────┐   │
+│  │     PTY Session Manager     │   │
+│  │  ┌───────────────────────┐  │   │
+│  │  │   node-pty process    │  │   │
+│  │  │   (persistent claude) │  │   │
+│  │  └───────────────────────┘  │   │
+│  └─────────────────────────────┘   │
+│              │                      │
+│    Real-time streaming              │
+│              ▼                      │
+│  ┌─────────────────────────────┐   │
+│  │    Output Buffer/Throttle    │   │
+│  │    (1 Discord edit/sec)     │   │
+│  └─────────────────────────────┘   │
+└─────────────────────────────────────┘
 ```
 
-When you send `/claude hello`:
+**Key difference from v1:** Instead of spawning a new `claude -p` for each message, we maintain a persistent PTY session. This means:
 
-1. Bot receives slash command
-2. Looks up your active session (if any)
-3. Spawns `claude -p "hello" --resume <session_id>`
-4. Streams output back to Discord
-5. Saves session ID for next message
+- Claude remembers the full conversation naturally
+- Thinking/processing shows in real-time
+- Commands like `/plugin` actually work
+- No process spawn overhead per message
 
-## Architecture
+## Setup
+
+### 1. Create Discord Bot
+
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Create new application → Bot → Add Bot
+3. Enable **Message Content Intent** (required!)
+4. Copy the Bot Token
+
+### 2. Invite Bot
 
 ```
-claude-code-discord/
-├── src/
-│   ├── index.js           # Entry point
-│   ├── bot.js             # Discord bot & slash commands
-│   ├── claude-manager.js  # Claude CLI process management
-│   └── utils/
-│       ├── session-store.js  # SQLite persistence
-│       └── formatter.js      # Terminal → Discord formatting
-├── .env.example
-├── package.json
-└── README.md
+https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=277025770560&scope=bot%20applications.commands
+```
+
+### 3. Configure
+
+```bash
+git clone https://github.com/deredescence/claude-code-discord.git
+cd claude-code-discord
+cp .env.example .env
+```
+
+Edit `.env`:
+```env
+DISCORD_TOKEN=your_bot_token
+DISCORD_CLIENT_ID=your_client_id
+DISCORD_GUILD_ID=your_server_id  # Optional, faster command registration
+CLAUDE_WORKDIR=/default/working/directory  # Optional
+```
+
+### 4. Run
+
+```bash
+npm install
+npm start
+```
+
+## Usage
+
+### Start a Session
+```
+/claude-start workdir:/path/to/project
+```
+
+### Chat with Claude
+```
+/claude fix the type error in utils.ts
+```
+
+Or just type directly in the channel:
+```
+Can you also add error handling?
+```
+
+### Run Claude Commands
+```
+/claude-command cmd:/plugin
+/claude-command cmd:/help
+/claude-command cmd:/config
+```
+
+### Resume a Previous Session
+```
+/claude-start resume:abc123...
 ```
 
 ## Requirements
@@ -126,33 +129,65 @@ claude-code-discord/
 - Node.js 18+
 - Claude Code CLI installed and authenticated
 - Discord Bot Token
+- Windows: Build tools for node-pty (`npm install --global windows-build-tools`)
 
-## Differences from Terminal
+## Architecture
+
+```
+src/
+├── index.js           # Entry point
+├── bot.js             # Discord bot & command handlers
+├── claude-manager.js  # PTY session management (node-pty)
+└── utils/
+    ├── session-store.js  # SQLite for session persistence
+    └── formatter.js      # Terminal → Discord output formatting
+```
+
+### Key Components
+
+**ClaudeSession (claude-manager.js)**
+- Wraps `node-pty` for true interactive mode
+- Handles input/output buffering
+- Detects "ready for input" state
+- Manages session lifecycle
+
+**Session Store (session-store.js)**
+- SQLite database for persistence
+- Maps Discord channel+user → Claude session ID
+- Enables `--resume` across bot restarts
+
+**Formatter (formatter.js)**
+- Strips ANSI escape codes
+- Splits long outputs for Discord's 2000 char limit
+- Detects thinking indicators
+
+## Terminal vs Discord
 
 | Feature | Terminal | Discord Bot |
 |---------|----------|-------------|
 | Flickering | Yes | No |
 | Mobile friendly | No | Yes |
-| Session resume | Manual `--resume` | Automatic |
-| File viewing | Inline | Attachment links |
+| Session resume | Manual | Automatic |
+| Interactive mode | Yes | **Yes** (PTY) |
+| Real-time output | Yes | **Yes** (streaming) |
+| /plugin, /config | Yes | **Yes** |
 | Multi-user | No | Yes |
-| Interactive mode | Yes | Coming soon |
 
 ## Limitations
 
-- No true interactive mode (yet) - each message is a separate `claude -p` call
-- No `/plugin` management through Discord (use terminal for that)
-- No real-time thinking display (streams final output only)
+- Output updates throttled to 1/sec (Discord rate limits)
+- Very long outputs get truncated
+- File uploads not yet supported (coming soon)
 
 ## Contributing
 
-PRs welcome! Key areas for improvement:
+PRs welcome! Areas for improvement:
 
-- [ ] True interactive mode (persistent process with PTY)
-- [ ] Plugin management commands
+- [ ] File/image attachment support
 - [ ] Thread-based conversations
+- [ ] Better thinking indicator display
 - [ ] Web dashboard for session viewing
-- [ ] Multiple working directory support
+- [ ] Multiple concurrent sessions per user
 
 ## License
 

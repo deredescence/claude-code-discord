@@ -1,6 +1,7 @@
 /**
- * Discord Bot Core
- * Handles Discord connection, slash commands, and message routing
+ * Discord Bot Core (Interactive PTY Version)
+ *
+ * Persistent Claude sessions with real-time streaming.
  */
 
 import {
@@ -10,13 +11,16 @@ import {
     REST,
     Routes,
     EmbedBuilder,
-    ActionRowBuilder,
-    ButtonBuilder,
-    ButtonStyle,
     ChannelType
 } from 'discord.js';
 
-import { ClaudeProcess, getProcess, setProcess, removeProcess } from './claude-manager.js';
+import {
+    ClaudeSession,
+    getOrCreateSession,
+    getSession,
+    killSession,
+    getAllSessions
+} from './claude-manager.js';
 import {
     initDatabase,
     getActiveSession,
@@ -26,62 +30,57 @@ import {
     deactivateSession,
     getAllUserSessions
 } from './utils/session-store.js';
-import { formatResponse, formatError, formatStatus, splitMessage } from './utils/formatter.js';
+import { formatResponse, formatError, splitMessage } from './utils/formatter.js';
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
-// Slash command definitions
+// Slash commands
 const commands = [
     new SlashCommandBuilder()
         .setName('claude')
         .setDescription('Send a message to Claude Code')
         .addStringOption(option =>
-            option.setName('prompt')
+            option.setName('message')
                 .setDescription('Your message to Claude')
                 .setRequired(true)
-        )
-        .addStringOption(option =>
-            option.setName('workdir')
-                .setDescription('Working directory for Claude (optional)')
-                .setRequired(false)
-        )
-        .addAttachmentOption(option =>
-            option.setName('file')
-                .setDescription('Attach a file for Claude to analyze')
-                .setRequired(false)
         ),
 
     new SlashCommandBuilder()
-        .setName('claude-new')
-        .setDescription('Start a new Claude Code session (forgets previous context)')
+        .setName('claude-start')
+        .setDescription('Start a new Claude Code session')
         .addStringOption(option =>
             option.setName('workdir')
-                .setDescription('Working directory for the new session')
+                .setDescription('Working directory')
                 .setRequired(false)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('claude-resume')
-        .setDescription('Resume a previous Claude Code session')
+        )
         .addStringOption(option =>
-            option.setName('session_id')
-                .setDescription('Session ID to resume (leave empty for most recent)')
+            option.setName('resume')
+                .setDescription('Session ID to resume')
                 .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName('claude-stop')
-        .setDescription('Stop the current Claude Code session'),
-
-    new SlashCommandBuilder()
-        .setName('claude-sessions')
-        .setDescription('List your recent Claude Code sessions'),
+        .setDescription('Stop your Claude Code session'),
 
     new SlashCommandBuilder()
         .setName('claude-status')
-        .setDescription('Check if Claude Code is running in this channel')
+        .setDescription('Check session status'),
+
+    new SlashCommandBuilder()
+        .setName('claude-command')
+        .setDescription('Run a Claude Code command (like /help, /config)')
+        .addStringOption(option =>
+            option.setName('cmd')
+                .setDescription('The command (e.g., /help, /plugin, /config)')
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('claude-sessions')
+        .setDescription('List your recent sessions')
 ];
 
 export class DiscordBot {
@@ -95,19 +94,16 @@ export class DiscordBot {
             ]
         });
 
+        // Track message updates for streaming
+        this.streamingMessages = new Map(); // channelId_userId -> { message, lastUpdate }
+
         this.setupEventHandlers();
     }
 
     async start() {
-        // Initialize database
         initDatabase();
-
-        // Register slash commands
         await this.registerCommands();
-
-        // Login to Discord
         await this.client.login(DISCORD_TOKEN);
-
         console.log('Discord bot started!');
     }
 
@@ -118,13 +114,11 @@ export class DiscordBot {
             console.log('Registering slash commands...');
 
             if (DISCORD_GUILD_ID) {
-                // Guild-specific (instant update)
                 await rest.put(
                     Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID),
                     { body: commands.map(c => c.toJSON()) }
                 );
             } else {
-                // Global (can take up to 1 hour)
                 await rest.put(
                     Routes.applicationCommands(DISCORD_CLIENT_ID),
                     { body: commands.map(c => c.toJSON()) }
@@ -143,296 +137,353 @@ export class DiscordBot {
         });
 
         this.client.on('interactionCreate', async (interaction) => {
-            if (interaction.isChatInputCommand()) {
-                await this.handleSlashCommand(interaction);
-            } else if (interaction.isButton()) {
-                await this.handleButton(interaction);
-            }
+            if (!interaction.isChatInputCommand()) return;
+            await this.handleCommand(interaction);
         });
 
-        // Handle regular messages in threads (for ongoing conversations)
+        // Handle regular messages as Claude input (if session exists)
         this.client.on('messageCreate', async (message) => {
-            // Ignore bots
             if (message.author.bot) return;
 
-            // Check if this is in a thread we're tracking
-            const proc = getProcess(message.channel.id, message.author.id);
-            if (proc && proc.isRunning) {
-                await this.handleThreadMessage(message, proc);
+            // Check for active session
+            const session = getSession(message.channel.id, message.author.id);
+            if (session && session.isRunning) {
+                await this.handleMessage(message, session);
             }
         });
     }
 
-    async handleSlashCommand(interaction) {
+    async handleCommand(interaction) {
         const { commandName } = interaction;
 
         switch (commandName) {
             case 'claude':
                 await this.handleClaude(interaction);
                 break;
-            case 'claude-new':
-                await this.handleClaudeNew(interaction);
-                break;
-            case 'claude-resume':
-                await this.handleClaudeResume(interaction);
+            case 'claude-start':
+                await this.handleClaudeStart(interaction);
                 break;
             case 'claude-stop':
                 await this.handleClaudeStop(interaction);
                 break;
-            case 'claude-sessions':
-                await this.handleClaudeSessions(interaction);
-                break;
             case 'claude-status':
                 await this.handleClaudeStatus(interaction);
+                break;
+            case 'claude-command':
+                await this.handleClaudeCommand(interaction);
+                break;
+            case 'claude-sessions':
+                await this.handleClaudeSessions(interaction);
                 break;
         }
     }
 
+    /**
+     * Main claude command - send message to persistent session
+     */
     async handleClaude(interaction) {
-        const prompt = interaction.options.getString('prompt');
-        const workdir = interaction.options.getString('workdir');
-        const file = interaction.options.getAttachment('file');
+        const message = interaction.options.getString('message');
 
         await interaction.deferReply();
 
         try {
             // Get or create session
-            let session = getActiveSession(interaction.channelId, interaction.user.id);
-            let claudeSessionId = null;
+            let dbSession = getActiveSession(interaction.channelId, interaction.user.id);
 
-            if (session) {
-                claudeSessionId = session.claude_session_id;
-                updateSessionTimestamp(session.id);
-            } else {
-                const sessionId = createSession(
-                    interaction.channelId,
-                    interaction.user.id,
-                    workdir || process.env.CLAUDE_WORKDIR
-                );
-                session = { id: sessionId };
+            if (!dbSession) {
+                // Auto-create session
+                const id = createSession(interaction.channelId, interaction.user.id);
+                dbSession = { id, working_directory: process.env.CLAUDE_WORKDIR };
             }
 
-            // Build prompt with file if attached
-            let fullPrompt = prompt;
-            if (file) {
-                fullPrompt = `[Attached file: ${file.name}]\nURL: ${file.url}\n\n${prompt}`;
-            }
-
-            // Create Claude process
-            const claude = new ClaudeProcess({
-                sessionId: claudeSessionId,
-                workingDir: workdir || process.env.CLAUDE_WORKDIR || process.cwd()
-            });
-
-            setProcess(interaction.channelId, interaction.user.id, claude);
-
-            // Stream output
-            let responseBuffer = '';
-            let lastUpdateTime = Date.now();
-            const UPDATE_INTERVAL = 1000; // Update every second
-
-            claude.on('output', async (chunk) => {
-                responseBuffer += chunk + '\n';
-
-                // Throttle updates
-                if (Date.now() - lastUpdateTime > UPDATE_INTERVAL) {
-                    try {
-                        const chunks = formatResponse(responseBuffer);
-                        if (chunks.length > 0) {
-                            await interaction.editReply(chunks[0].substring(0, 2000));
-                        }
-                    } catch (e) {
-                        // Ignore edit errors during streaming
-                    }
-                    lastUpdateTime = Date.now();
+            const session = getOrCreateSession(
+                interaction.channelId,
+                interaction.user.id,
+                {
+                    sessionId: dbSession.claude_session_id,
+                    workingDir: dbSession.working_directory
                 }
-            });
+            );
 
-            claude.on('session', (newSessionId) => {
-                updateSessionClaudeId(session.id, newSessionId);
-            });
+            // Set up streaming to Discord
+            const key = `${interaction.channelId}_${interaction.user.id}`;
+            let outputBuffer = '';
+            let lastEdit = Date.now();
+            const EDIT_INTERVAL = 1000; // Edit message every second max
 
-            // Execute prompt
-            const result = await claude.execute(fullPrompt, {
-                continueSession: !!claudeSessionId
-            });
+            const outputHandler = async (chunk) => {
+                outputBuffer += chunk;
 
-            // Update session
-            if (result.sessionId) {
-                updateSessionClaudeId(session.id, result.sessionId);
-            }
+                // Throttle Discord edits
+                if (Date.now() - lastEdit > EDIT_INTERVAL) {
+                    try {
+                        const display = outputBuffer.length > 1900
+                            ? '...' + outputBuffer.slice(-1900)
+                            : outputBuffer;
+                        await interaction.editReply(`\`\`\`\n${display}\n\`\`\``);
+                        lastEdit = Date.now();
+                    } catch (e) {
+                        // Edit failed, continue
+                    }
+                }
+            };
+
+            const thinkingHandler = () => {
+                // Show thinking indicator
+            };
+
+            const sessionHandler = (newId) => {
+                updateSessionClaudeId(dbSession.id, newId);
+            };
+
+            session.on('output', outputHandler);
+            session.on('thinking', thinkingHandler);
+            session.on('session', sessionHandler);
+
+            // Send message and wait for response
+            const response = await session.send(message);
+
+            // Clean up listeners
+            session.off('output', outputHandler);
+            session.off('thinking', thinkingHandler);
+            session.off('session', sessionHandler);
+
+            // Update timestamp
+            updateSessionTimestamp(dbSession.id);
 
             // Send final response
-            const chunks = formatResponse(result.output);
-
+            const chunks = formatResponse(response);
             if (chunks.length === 0) {
-                await interaction.editReply('*(No output)*');
-            } else if (chunks.length === 1) {
-                await interaction.editReply(chunks[0]);
+                await interaction.editReply('*(No response)*');
             } else {
-                // Send first chunk as reply, rest as follow-ups
-                await interaction.editReply(chunks[0]);
-                for (let i = 1; i < chunks.length; i++) {
-                    await interaction.followUp(chunks[i]);
+                await interaction.editReply(chunks[0].substring(0, 2000));
+
+                for (let i = 1; i < Math.min(chunks.length, 5); i++) {
+                    await interaction.followUp(chunks[i].substring(0, 2000));
+                }
+
+                if (chunks.length > 5) {
+                    await interaction.followUp(`*(${chunks.length - 5} more chunks truncated)*`);
                 }
             }
-
-            // Add continue button
-            const row = new ActionRowBuilder()
-                .addComponents(
-                    new ButtonBuilder()
-                        .setCustomId('claude_continue')
-                        .setLabel('Continue')
-                        .setStyle(ButtonStyle.Primary),
-                    new ButtonBuilder()
-                        .setCustomId('claude_new')
-                        .setLabel('New Session')
-                        .setStyle(ButtonStyle.Secondary)
-                );
-
-            await interaction.followUp({ components: [row], ephemeral: true });
 
         } catch (error) {
             console.error('Claude error:', error);
             await interaction.editReply(formatError(error));
-        } finally {
-            removeProcess(interaction.channelId, interaction.user.id);
         }
     }
 
-    async handleClaudeNew(interaction) {
+    /**
+     * Start new session explicitly
+     */
+    async handleClaudeStart(interaction) {
         const workdir = interaction.options.getString('workdir');
+        const resumeId = interaction.options.getString('resume');
 
-        // Deactivate any existing session
+        await interaction.deferReply({ ephemeral: true });
+
+        try {
+            // Kill existing session if any
+            killSession(interaction.channelId, interaction.user.id);
+
+            // Deactivate old DB session
+            const existing = getActiveSession(interaction.channelId, interaction.user.id);
+            if (existing) {
+                deactivateSession(existing.id);
+            }
+
+            // Create new DB session
+            const sessionId = createSession(
+                interaction.channelId,
+                interaction.user.id,
+                workdir || process.env.CLAUDE_WORKDIR
+            );
+
+            if (resumeId) {
+                updateSessionClaudeId(sessionId, resumeId);
+            }
+
+            // Start the PTY session
+            const session = getOrCreateSession(
+                interaction.channelId,
+                interaction.user.id,
+                {
+                    sessionId: resumeId,
+                    workingDir: workdir || process.env.CLAUDE_WORKDIR
+                }
+            );
+
+            // Wait for it to be ready
+            await new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('Startup timeout')), 30000);
+
+                session.once('ready', () => {
+                    clearTimeout(timeout);
+                    resolve();
+                });
+
+                session.once('close', () => {
+                    clearTimeout(timeout);
+                    reject(new Error('Session closed unexpectedly'));
+                });
+            });
+
+            await interaction.editReply(
+                `✅ **Claude Code session started!**\n` +
+                `Working directory: \`${workdir || 'default'}\`\n` +
+                `${resumeId ? `Resumed: \`${resumeId}\`\n` : ''}` +
+                `\nSend messages with \`/claude\` or just type in this channel.`
+            );
+
+        } catch (error) {
+            console.error('Start error:', error);
+            await interaction.editReply(`❌ Failed to start session: ${error.message}`);
+        }
+    }
+
+    /**
+     * Stop session
+     */
+    async handleClaudeStop(interaction) {
+        const killed = killSession(interaction.channelId, interaction.user.id);
+
         const existing = getActiveSession(interaction.channelId, interaction.user.id);
         if (existing) {
             deactivateSession(existing.id);
         }
 
-        // Remove any running process
-        removeProcess(interaction.channelId, interaction.user.id);
-
-        // Create new session
-        createSession(
-            interaction.channelId,
-            interaction.user.id,
-            workdir || process.env.CLAUDE_WORKDIR
-        );
-
         await interaction.reply({
-            content: '✅ New Claude Code session started. Use `/claude` to send messages.',
+            content: killed ? '⏹️ Session stopped.' : 'No active session.',
             ephemeral: true
         });
     }
 
-    async handleClaudeResume(interaction) {
-        const sessionId = interaction.options.getString('session_id');
+    /**
+     * Session status
+     */
+    async handleClaudeStatus(interaction) {
+        const session = getSession(interaction.channelId, interaction.user.id);
+        const dbSession = getActiveSession(interaction.channelId, interaction.user.id);
 
-        await interaction.deferReply({ ephemeral: true });
+        const embed = new EmbedBuilder()
+            .setTitle('Claude Code Session')
+            .setColor(session?.isRunning ? 0x57F287 : 0x99AAB5)
+            .addFields(
+                {
+                    name: 'Status',
+                    value: session?.isRunning
+                        ? (session.isReady ? '🟢 Ready' : '🟡 Processing')
+                        : '⚪ Inactive',
+                    inline: true
+                },
+                {
+                    name: 'Session ID',
+                    value: dbSession?.claude_session_id?.substring(0, 12) + '...' || 'None',
+                    inline: true
+                },
+                {
+                    name: 'Working Dir',
+                    value: dbSession?.working_directory || 'Default',
+                    inline: true
+                }
+            );
 
-        if (sessionId) {
-            // Resume specific session
-            const sessions = getAllUserSessions(interaction.user.id);
-            const session = sessions.find(s => s.claude_session_id === sessionId);
+        if (session?.isRunning) {
+            const uptime = Math.floor((Date.now() - session.lastActivity) / 1000);
+            embed.addFields({
+                name: 'Last Activity',
+                value: `${uptime}s ago`,
+                inline: true
+            });
+        }
 
-            if (!session) {
-                await interaction.editReply('❌ Session not found. Use `/claude-sessions` to see your sessions.');
-                return;
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    /**
+     * Run Claude Code commands like /help, /plugin, /config
+     */
+    async handleClaudeCommand(interaction) {
+        const cmd = interaction.options.getString('cmd');
+
+        await interaction.deferReply();
+
+        const session = getSession(interaction.channelId, interaction.user.id);
+
+        if (!session || !session.isRunning) {
+            await interaction.editReply('❌ No active session. Use `/claude-start` first.');
+            return;
+        }
+
+        try {
+            const response = await session.command(cmd);
+            const chunks = formatResponse(response);
+
+            if (chunks.length === 0) {
+                await interaction.editReply(`\`${cmd}\` - *(no output)*`);
+            } else {
+                await interaction.editReply(`**${cmd}**\n${chunks[0].substring(0, 1900)}`);
+
+                for (let i = 1; i < Math.min(chunks.length, 3); i++) {
+                    await interaction.followUp(chunks[i].substring(0, 2000));
+                }
             }
-
-            // Reactivate session in this channel
-            createSession(interaction.channelId, interaction.user.id, session.working_directory);
-            updateSessionClaudeId(session.id, sessionId);
-
-            await interaction.editReply(`✅ Resumed session \`${sessionId}\``);
-        } else {
-            // Resume most recent
-            const session = getActiveSession(interaction.channelId, interaction.user.id);
-
-            if (!session?.claude_session_id) {
-                await interaction.editReply('❌ No active session to resume. Use `/claude` to start one.');
-                return;
-            }
-
-            await interaction.editReply(`✅ Ready to continue session \`${session.claude_session_id}\``);
+        } catch (error) {
+            await interaction.editReply(formatError(error));
         }
     }
 
-    async handleClaudeStop(interaction) {
-        const proc = getProcess(interaction.channelId, interaction.user.id);
-
-        if (proc) {
-            removeProcess(interaction.channelId, interaction.user.id);
-            await interaction.reply({
-                content: '⏹️ Claude Code session stopped.',
-                ephemeral: true
-            });
-        } else {
-            await interaction.reply({
-                content: 'No active Claude process in this channel.',
-                ephemeral: true
-            });
-        }
-    }
-
+    /**
+     * List sessions
+     */
     async handleClaudeSessions(interaction) {
         const sessions = getAllUserSessions(interaction.user.id);
 
         if (sessions.length === 0) {
             await interaction.reply({
-                content: 'No sessions found. Use `/claude` to start one.',
+                content: 'No sessions found.',
                 ephemeral: true
             });
             return;
         }
 
         const embed = new EmbedBuilder()
-            .setTitle('Your Claude Code Sessions')
+            .setTitle('Your Sessions')
             .setColor(0x5865F2)
             .setDescription(
-                sessions.map((s, i) => {
+                sessions.slice(0, 15).map((s, i) => {
                     const status = s.is_active ? '🟢' : '⚪';
-                    const sessionId = s.claude_session_id?.substring(0, 8) || 'pending';
+                    const id = s.claude_session_id?.substring(0, 8) || 'pending';
                     const date = new Date(s.updated_at).toLocaleDateString();
-                    return `${status} \`${sessionId}...\` - ${date} - ${s.working_directory || 'default'}`;
+                    return `${status} \`${id}...\` - ${date}`;
                 }).join('\n')
             );
 
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    async handleClaudeStatus(interaction) {
-        const session = getActiveSession(interaction.channelId, interaction.user.id);
-        const proc = getProcess(interaction.channelId, interaction.user.id);
+    /**
+     * Handle regular messages as Claude input
+     */
+    async handleMessage(message, session) {
+        // React to show we're processing
+        await message.react('⏳');
 
-        const embed = new EmbedBuilder()
-            .setTitle('Claude Code Status')
-            .setColor(proc ? 0x57F287 : 0x99AAB5)
-            .addFields(
-                { name: 'Session', value: session?.claude_session_id || 'None', inline: true },
-                { name: 'Process', value: proc ? 'Running' : 'Idle', inline: true },
-                { name: 'Working Dir', value: session?.working_directory || 'Default', inline: true }
-            );
-
-        await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    async handleButton(interaction) {
-        if (interaction.customId === 'claude_continue') {
-            await interaction.reply({
-                content: 'Use `/claude` to send your next message. The session will continue automatically.',
-                ephemeral: true
-            });
-        } else if (interaction.customId === 'claude_new') {
-            await this.handleClaudeNew(interaction);
-        }
-    }
-
-    async handleThreadMessage(message, proc) {
-        // This handles ongoing interactive sessions
         try {
-            proc.send(message.content);
+            const response = await session.send(message.content);
+
+            // Remove processing reaction
+            await message.reactions.removeAll().catch(() => {});
+
+            // Send response
+            const chunks = formatResponse(response);
+            if (chunks.length > 0) {
+                for (const chunk of chunks.slice(0, 5)) {
+                    await message.reply(chunk.substring(0, 2000));
+                }
+            }
         } catch (error) {
+            await message.reactions.removeAll().catch(() => {});
             await message.reply(formatError(error));
         }
     }
