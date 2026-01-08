@@ -1,55 +1,48 @@
 /**
- * Discord Bot Core (Interactive PTY Version)
- *
- * Persistent Claude sessions with real-time streaming.
+ * Claude Code Discord Bot
  */
 
-import {
-    Client,
-    GatewayIntentBits,
-    SlashCommandBuilder,
-    REST,
-    Routes,
-    EmbedBuilder,
-    ChannelType
-} from 'discord.js';
+import { Client, GatewayIntentBits, Partials, EmbedBuilder, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { getOrCreateSession, removeSession, getSession } from './claude-manager.js';
+import { getActiveSession, createSession, deactivateSession, updateSessionClaudeId, addMessage, updateSessionTimestamp, initDatabase, getAllUserSessions, getSessionById, getSessionMessages } from './utils/session-store.js';
+import { formatResponseSmart, formatError, formatStructuredOutput, splitMessage } from './utils/formatter.js';
+import { processAttachment } from './utils/attachments.js';
+import 'dotenv/config';
 
-import {
-    ClaudeSession,
-    getOrCreateSession,
-    getSession,
-    killSession,
-    getAllSessions
-} from './claude-manager.js';
-import {
-    initDatabase,
-    getActiveSession,
-    createSession,
-    updateSessionClaudeId,
-    updateSessionTimestamp,
-    deactivateSession,
-    getAllUserSessions
-} from './utils/session-store.js';
-import { formatResponse, formatError, splitMessage } from './utils/formatter.js';
-
+// Bot configuration
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
 
-// Slash commands
+const ALLOWED_CHANNELS = process.env.ALLOWED_CHANNELS ? process.env.ALLOWED_CHANNELS.split(',') : [];
+const ALLOWED_USERS = process.env.ALLOWED_USERS ? process.env.ALLOWED_USERS.split(',') : [];
+
+// Per-user display mode: 'raw' (default) or 'clean'
+const userDisplayModes = new Map();
+const MODE_TOGGLE_TRIGGER = 'ctrl+t';
+
+/**
+ * Get display mode for a user (default: raw)
+ */
+function getDisplayMode(userId) {
+    return userDisplayModes.get(userId) || 'raw';
+}
+
+/**
+ * Toggle display mode for a user
+ */
+function toggleDisplayMode(userId) {
+    const current = getDisplayMode(userId);
+    const next = current === 'raw' ? 'clean' : 'raw';
+    userDisplayModes.set(userId, next);
+    return next;
+}
+
+// Slash commands definition
 const commands = [
     new SlashCommandBuilder()
-        .setName('claude')
-        .setDescription('Send a message to Claude Code')
-        .addStringOption(option =>
-            option.setName('message')
-                .setDescription('Your message to Claude')
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
         .setName('claude-start')
-        .setDescription('Start a new Claude Code session')
+        .setDescription('Start a Claude Code session')
         .addStringOption(option =>
             option.setName('workdir')
                 .setDescription('Working directory')
@@ -62,7 +55,7 @@ const commands = [
         ),
 
     new SlashCommandBuilder()
-        .setName('claude-stop')
+        .setName('stop')
         .setDescription('Stop your Claude Code session'),
 
     new SlashCommandBuilder()
@@ -70,18 +63,24 @@ const commands = [
         .setDescription('Check session status'),
 
     new SlashCommandBuilder()
-        .setName('claude-command')
-        .setDescription('Run a Claude Code command (like /help, /config)')
-        .addStringOption(option =>
-            option.setName('cmd')
-                .setDescription('The command (e.g., /help, /plugin, /config)')
-                .setRequired(true)
-        ),
+        .setName('claude-sessions')
+        .setDescription('List your recent sessions'),
 
     new SlashCommandBuilder()
-        .setName('claude-sessions')
-        .setDescription('List your recent sessions')
+        .setName('claude-history')
+        .setDescription('View message history for a session')
+        .addIntegerOption(option =>
+            option.setName('session')
+                .setDescription('Session ID (from /claude-sessions)')
+                .setRequired(false)
+        )
 ];
+
+// Claude Code logo
+const CLAUDE_LOGO = `\`\`\`
+╲╱╲╱  Claude Code v2.1.1
+╱╲╱╲  {{MODEL}} · {{DIR}}
+\`\`\``;
 
 export class DiscordBot {
     constructor() {
@@ -91,17 +90,15 @@ export class DiscordBot {
                 GatewayIntentBits.GuildMessages,
                 GatewayIntentBits.MessageContent,
                 GatewayIntentBits.DirectMessages
-            ]
+            ],
+            partials: [Partials.Channel]
         });
-
-        // Track message updates for streaming
-        this.streamingMessages = new Map(); // channelId_userId -> { message, lastUpdate }
 
         this.setupEventHandlers();
     }
 
     async start() {
-        initDatabase();
+        await initDatabase();
         await this.registerCommands();
         await this.client.login(DISCORD_TOKEN);
         console.log('Discord bot started!');
@@ -112,7 +109,6 @@ export class DiscordBot {
 
         try {
             console.log('Registering slash commands...');
-
             if (DISCORD_GUILD_ID) {
                 await rest.put(
                     Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID),
@@ -124,7 +120,6 @@ export class DiscordBot {
                     { body: commands.map(c => c.toJSON()) }
                 );
             }
-
             console.log('Slash commands registered!');
         } catch (error) {
             console.error('Failed to register commands:', error);
@@ -138,353 +133,353 @@ export class DiscordBot {
 
         this.client.on('interactionCreate', async (interaction) => {
             if (!interaction.isChatInputCommand()) return;
-            await this.handleCommand(interaction);
+            try {
+                await this.handleCommand(interaction);
+            } catch (err) {
+                console.error('Command error:', err.message);
+            }
         });
 
-        // Handle regular messages as Claude input (if session exists)
         this.client.on('messageCreate', async (message) => {
-            if (message.author.bot) return;
-
-            // Check for active session
-            const session = getSession(message.channel.id, message.author.id);
-            if (session && session.isRunning) {
-                await this.handleMessage(message, session);
-            }
+            await this.handleMessage(message);
         });
     }
 
     async handleCommand(interaction) {
         const { commandName } = interaction;
-
         switch (commandName) {
-            case 'claude':
-                await this.handleClaude(interaction);
-                break;
-            case 'claude-start':
-                await this.handleClaudeStart(interaction);
-                break;
-            case 'claude-stop':
-                await this.handleClaudeStop(interaction);
-                break;
-            case 'claude-status':
-                await this.handleClaudeStatus(interaction);
-                break;
-            case 'claude-command':
-                await this.handleClaudeCommand(interaction);
-                break;
-            case 'claude-sessions':
-                await this.handleClaudeSessions(interaction);
-                break;
+            case 'claude-start': await this.handleClaudeStart(interaction); break;
+            case 'stop': await this.handleClaudeStop(interaction); break;
+            case 'claude-status': await this.handleClaudeStatus(interaction); break;
+            case 'claude-sessions': await this.handleClaudeSessions(interaction); break;
+            case 'claude-history': await this.handleClaudeHistory(interaction); break;
         }
     }
 
-    /**
-     * Main claude command - send message to persistent session
-     */
-    async handleClaude(interaction) {
-        const message = interaction.options.getString('message');
-
-        await interaction.deferReply();
-
-        try {
-            // Get or create session
-            let dbSession = getActiveSession(interaction.channelId, interaction.user.id);
-
-            if (!dbSession) {
-                // Auto-create session
-                const id = createSession(interaction.channelId, interaction.user.id);
-                dbSession = { id, working_directory: process.env.CLAUDE_WORKDIR };
-            }
-
-            const session = getOrCreateSession(
-                interaction.channelId,
-                interaction.user.id,
-                {
-                    sessionId: dbSession.claude_session_id,
-                    workingDir: dbSession.working_directory
-                }
-            );
-
-            // Set up streaming to Discord
-            const key = `${interaction.channelId}_${interaction.user.id}`;
-            let outputBuffer = '';
-            let lastEdit = Date.now();
-            const EDIT_INTERVAL = 1000; // Edit message every second max
-
-            const outputHandler = async (chunk) => {
-                outputBuffer += chunk;
-
-                // Throttle Discord edits
-                if (Date.now() - lastEdit > EDIT_INTERVAL) {
-                    try {
-                        const display = outputBuffer.length > 1900
-                            ? '...' + outputBuffer.slice(-1900)
-                            : outputBuffer;
-                        await interaction.editReply(`\`\`\`\n${display}\n\`\`\``);
-                        lastEdit = Date.now();
-                    } catch (e) {
-                        // Edit failed, continue
-                    }
-                }
-            };
-
-            const thinkingHandler = () => {
-                // Show thinking indicator
-            };
-
-            const sessionHandler = (newId) => {
-                updateSessionClaudeId(dbSession.id, newId);
-            };
-
-            session.on('output', outputHandler);
-            session.on('thinking', thinkingHandler);
-            session.on('session', sessionHandler);
-
-            // Send message and wait for response
-            const response = await session.send(message);
-
-            // Clean up listeners
-            session.off('output', outputHandler);
-            session.off('thinking', thinkingHandler);
-            session.off('session', sessionHandler);
-
-            // Update timestamp
-            updateSessionTimestamp(dbSession.id);
-
-            // Send final response
-            const chunks = formatResponse(response);
-            if (chunks.length === 0) {
-                await interaction.editReply('*(No response)*');
-            } else {
-                await interaction.editReply(chunks[0].substring(0, 2000));
-
-                for (let i = 1; i < Math.min(chunks.length, 5); i++) {
-                    await interaction.followUp(chunks[i].substring(0, 2000));
-                }
-
-                if (chunks.length > 5) {
-                    await interaction.followUp(`*(${chunks.length - 5} more chunks truncated)*`);
-                }
-            }
-
-        } catch (error) {
-            console.error('Claude error:', error);
-            await interaction.editReply(formatError(error));
-        }
-    }
-
-    /**
-     * Start new session explicitly
-     */
     async handleClaudeStart(interaction) {
         const workdir = interaction.options.getString('workdir');
         const resumeId = interaction.options.getString('resume');
-
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply();
 
         try {
-            // Kill existing session if any
-            killSession(interaction.channelId, interaction.user.id);
-
-            // Deactivate old DB session
+            removeSession(interaction.channelId, interaction.user.id);
             const existing = getActiveSession(interaction.channelId, interaction.user.id);
-            if (existing) {
-                deactivateSession(existing.id);
-            }
+            if (existing) deactivateSession(existing.id);
 
-            // Create new DB session
-            const sessionId = createSession(
-                interaction.channelId,
-                interaction.user.id,
-                workdir || process.env.CLAUDE_WORKDIR
-            );
+            const dir = workdir || process.env.CLAUDE_WORKDIR || '.';
+            const sessionId = createSession(interaction.channelId, interaction.user.id, dir);
+            if (resumeId) updateSessionClaudeId(sessionId, resumeId);
 
-            if (resumeId) {
-                updateSessionClaudeId(sessionId, resumeId);
-            }
-
-            // Start the PTY session
-            const session = getOrCreateSession(
-                interaction.channelId,
-                interaction.user.id,
-                {
-                    sessionId: resumeId,
-                    workingDir: workdir || process.env.CLAUDE_WORKDIR
-                }
-            );
-
-            // Wait for it to be ready
-            await new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => reject(new Error('Startup timeout')), 30000);
-
-                session.once('ready', () => {
-                    clearTimeout(timeout);
-                    resolve();
-                });
-
-                session.once('close', () => {
-                    clearTimeout(timeout);
-                    reject(new Error('Session closed unexpectedly'));
-                });
+            getOrCreateSession(interaction.channelId, interaction.user.id, {
+                sessionId: resumeId,
+                workingDir: dir
             });
 
-            await interaction.editReply(
-                `✅ **Claude Code session started!**\n` +
-                `Working directory: \`${workdir || 'default'}\`\n` +
-                `${resumeId ? `Resumed: \`${resumeId}\`\n` : ''}` +
-                `\nSend messages with \`/claude\` or just type in this channel.`
-            );
+            const logo = CLAUDE_LOGO
+                .replace('{{MODEL}}', process.env.CLAUDE_MODEL || 'claude')
+                .replace('{{DIR}}', dir.length > 30 ? '...' + dir.slice(-27) : dir);
 
+            const embed = new EmbedBuilder()
+                .setColor(0xE07A2D)
+                .setDescription(logo + '\n' + (resumeId ? `*Resuming session \`${resumeId.substring(0, 8)}...\`*\n\n` : '\n') + '**Type your messages below.** Use `/stop` when done.')
+                .setFooter({ text: `Session #${sessionId} • ${interaction.user.username}` });
+
+            await interaction.editReply({ embeds: [embed] });
         } catch (error) {
             console.error('Start error:', error);
-            await interaction.editReply(`❌ Failed to start session: ${error.message}`);
+            await interaction.editReply(`Failed to start session: ${error.message}`);
         }
     }
 
-    /**
-     * Stop session
-     */
     async handleClaudeStop(interaction) {
-        const killed = killSession(interaction.channelId, interaction.user.id);
+        const session = getSession(interaction.channelId, interaction.user.id);
+        const dbSession = getActiveSession(interaction.channelId, interaction.user.id);
+        const hadSession = !!session || !!dbSession;
 
-        const existing = getActiveSession(interaction.channelId, interaction.user.id);
-        if (existing) {
-            deactivateSession(existing.id);
+        removeSession(interaction.channelId, interaction.user.id);
+        if (dbSession) deactivateSession(dbSession.id);
+
+        if (hadSession) {
+            const embed = new EmbedBuilder()
+                .setColor(0x6B7280)
+                .setTitle('Session Ended')
+                .setDescription('Use `/claude-start` to begin a new session.')
+                .setTimestamp();
+            await interaction.reply({ embeds: [embed] });
+        } else {
+            await interaction.reply({ content: 'No active session to stop.', ephemeral: true });
         }
-
-        await interaction.reply({
-            content: killed ? '⏹️ Session stopped.' : 'No active session.',
-            ephemeral: true
-        });
     }
 
-    /**
-     * Session status
-     */
     async handleClaudeStatus(interaction) {
         const session = getSession(interaction.channelId, interaction.user.id);
         const dbSession = getActiveSession(interaction.channelId, interaction.user.id);
-
         const embed = new EmbedBuilder()
             .setTitle('Claude Code Session')
-            .setColor(session?.isRunning ? 0x57F287 : 0x99AAB5)
+            .setColor(session ? 0x57F287 : 0x99AAB5)
             .addFields(
-                {
-                    name: 'Status',
-                    value: session?.isRunning
-                        ? (session.isReady ? '🟢 Ready' : '🟡 Processing')
-                        : '⚪ Inactive',
-                    inline: true
-                },
-                {
-                    name: 'Session ID',
-                    value: dbSession?.claude_session_id?.substring(0, 12) + '...' || 'None',
-                    inline: true
-                },
-                {
-                    name: 'Working Dir',
-                    value: dbSession?.working_directory || 'Default',
-                    inline: true
-                }
+                { name: 'Status', value: session ? (session.isProcessing ? 'Processing' : 'Ready') : 'Inactive', inline: true },
+                { name: 'Session ID', value: (dbSession && dbSession.claude_session_id) ? (dbSession.claude_session_id.substring(0, 12) + '...') : 'None', inline: true },
+                { name: 'Working Dir', value: dbSession?.working_directory || 'Default', inline: true }
             );
-
-        if (session?.isRunning) {
-            const uptime = Math.floor((Date.now() - session.lastActivity) / 1000);
-            embed.addFields({
-                name: 'Last Activity',
-                value: `${uptime}s ago`,
-                inline: true
-            });
-        }
-
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
-    /**
-     * Run Claude Code commands like /help, /plugin, /config
-     */
-    async handleClaudeCommand(interaction) {
-        const cmd = interaction.options.getString('cmd');
-
-        await interaction.deferReply();
-
-        const session = getSession(interaction.channelId, interaction.user.id);
-
-        if (!session || !session.isRunning) {
-            await interaction.editReply('❌ No active session. Use `/claude-start` first.');
-            return;
-        }
-
-        try {
-            const response = await session.command(cmd);
-            const chunks = formatResponse(response);
-
-            if (chunks.length === 0) {
-                await interaction.editReply(`\`${cmd}\` - *(no output)*`);
-            } else {
-                await interaction.editReply(`**${cmd}**\n${chunks[0].substring(0, 1900)}`);
-
-                for (let i = 1; i < Math.min(chunks.length, 3); i++) {
-                    await interaction.followUp(chunks[i].substring(0, 2000));
-                }
-            }
-        } catch (error) {
-            await interaction.editReply(formatError(error));
-        }
-    }
-
-    /**
-     * List sessions
-     */
     async handleClaudeSessions(interaction) {
         const sessions = getAllUserSessions(interaction.user.id);
-
         if (sessions.length === 0) {
-            await interaction.reply({
-                content: 'No sessions found.',
-                ephemeral: true
-            });
+            await interaction.reply({ content: 'No sessions found.', ephemeral: true });
             return;
         }
-
         const embed = new EmbedBuilder()
             .setTitle('Your Sessions')
             .setColor(0x5865F2)
-            .setDescription(
-                sessions.slice(0, 15).map((s, i) => {
-                    const status = s.is_active ? '🟢' : '⚪';
-                    const id = s.claude_session_id?.substring(0, 8) || 'pending';
-                    const date = new Date(s.updated_at).toLocaleDateString();
-                    return `${status} \`${id}...\` - ${date}`;
-                }).join('\n')
-            );
+            .setDescription(sessions.slice(0, 15).map(s => {
+                const status = s.is_active ? '🟢' : '⚪';
+                const claudeId = s.claude_session_id?.substring(0, 8) || 'pending';
+                const date = new Date(s.updated_at).toLocaleDateString();
+                return `${status} **#${s.id}** \`${claudeId}...\` - ${date}`;
+            }).join('\n'))
+            .setFooter({ text: 'Use /claude-history session:<id> to view messages' });
+        await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
 
+    async handleClaudeHistory(interaction) {
+        // ... (simplified for brevity, similar to previous implementation)
+         const sessionIdParam = interaction.options.getInteger('session');
+        let targetSession;
+        if (sessionIdParam) {
+            targetSession = getSessionById(sessionIdParam);
+            if (!targetSession || targetSession.discord_user_id !== interaction.user.id) {
+                await interaction.reply({ content: 'Session not found or not yours.', ephemeral: true });
+                return;
+            }
+        } else {
+            targetSession = getActiveSession(interaction.channelId, interaction.user.id);
+            if (!targetSession) {
+                await interaction.reply({ content: 'No active session.', ephemeral: true });
+                return;
+            }
+        }
+
+        const messages = getSessionMessages(targetSession.id, 20);
+        if (messages.length === 0) {
+            await interaction.reply({ content: 'No messages yet.', ephemeral: true });
+            return;
+        }
+
+        const historyText = messages.map(m => {
+            const role = m.role === 'user' ? '**You:**' : '**Claude:**';
+            return `${role} ${m.content.substring(0, 200)}...`;
+        }).join('\n\n');
+
+        const embed = new EmbedBuilder()
+            .setTitle(`Session #${targetSession.id} History`)
+            .setColor(0x5865F2)
+            .setDescription(historyText.substring(0, 4000));
         await interaction.reply({ embeds: [embed], ephemeral: true });
     }
 
     /**
-     * Handle regular messages as Claude input
+     * Handle message with mode toggle and streaming
      */
-    async handleMessage(message, session) {
-        // React to show we're processing
-        await message.react('⏳');
+    async handleMessage(message) {
+        if (message.author.bot) return;
+        if (ALLOWED_CHANNELS.length > 0 && !ALLOWED_CHANNELS.includes(message.channelId)) return;
+        if (ALLOWED_USERS.length > 0 && !ALLOWED_USERS.includes(message.author.id)) return;
+
+        // Mode Toggle
+        if (message.content.trim().toLowerCase() === MODE_TOGGLE_TRIGGER) {
+            const newMode = toggleDisplayMode(message.author.id);
+            try { await message.delete(); } catch (e) {}
+            const notice = await message.channel.send(`-# 🔄 Display mode switched to: **${newMode.toUpperCase()}**`);
+            setTimeout(() => notice.delete().catch(() => {}), 3000);
+            return;
+        }
+
+        // Check for session
+        const session = getSession(message.channel.id, message.author.id);
+        if (!session) return; // Only process if session exists (user must /claude-start)
+
+        // Check if already processing - show friendly message instead of error
+        if (session.isProcessing) {
+            try {
+                await message.react('⏳');
+                const notice = await message.reply('-# ⏳ Still processing your previous message. Please wait...');
+                setTimeout(() => notice.delete().catch(() => {}), 5000);
+            } catch (e) {}
+            return;
+        }
 
         try {
-            const response = await session.send(message.content);
+            await message.channel.sendTyping();
 
-            // Remove processing reaction
-            await message.reactions.removeAll().catch(() => {});
+            // Build content array for Claude Code
+            let contentArray = [];
 
-            // Send response
-            const chunks = formatResponse(response);
-            if (chunks.length > 0) {
-                for (const chunk of chunks.slice(0, 5)) {
-                    await message.reply(chunk.substring(0, 2000));
+            // Add text content
+            if (message.content) {
+                contentArray.push({ type: 'text', text: message.content });
+            }
+
+            // Process image attachments
+            for (const att of message.attachments.values()) {
+                const imageData = await processAttachment(att);
+                if (imageData) {
+                    contentArray.push({
+                        type: 'image',
+                        source: {
+                            type: 'base64',
+                            media_type: imageData.mediaType,
+                            data: imageData.base64
+                        }
+                    });
                 }
             }
+
+            // If no content, skip
+            if (contentArray.length === 0) return;
+
+            const replyMessage = await message.reply('`░░░░░░░░░░` Thinking...');
+
+            // Stream state
+            const streamBlocks = []; // {type: 'text'|'thinking'|'tool', content: string}
+            let lastUpdateTime = Date.now();
+            let pendingQuestion = null; // Track AskUserQuestion for separate handling
+            let currentStatus = 'Thinking...'; // Current activity status
+            let startTime = Date.now();
+            let statusInterval = null;
+
+            // Animated progress bar frames
+            const progressFrames = ['`░░░░░░░░░░`', '`█░░░░░░░░░`', '`██░░░░░░░░`', '`███░░░░░░░`', '`████░░░░░░`', '`█████░░░░░`', '`██████░░░░`', '`███████░░░`', '`████████░░`', '`█████████░`', '`██████████`'];
+            let frameIndex = 0;
+
+            const formatStatusLine = () => {
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                const mins = Math.floor(elapsed / 60);
+                const secs = elapsed % 60;
+                const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+                const frame = progressFrames[frameIndex % progressFrames.length];
+                frameIndex++;
+                return `\n${frame} ${currentStatus} *(${timeStr})*`;
+            };
+
+            const updateMessage = async (final = false) => {
+                const now = Date.now();
+                if (!final && now - lastUpdateTime < 1000) return; // 1s throttle
+                lastUpdateTime = now;
+
+                try {
+                    const mode = getDisplayMode(message.author.id);
+                    let formatted = formatStructuredOutput(streamBlocks, mode);
+
+                    // Add animated status line at bottom (unless final)
+                    if (!final) {
+                        formatted += formatStatusLine();
+                    }
+
+                    const chunks = splitMessage(formatted || 'Processing...');
+                    if (chunks.length > 0) {
+                        await replyMessage.edit(chunks[0]);
+                    }
+                } catch (e) {
+                    // Edit failed, continue
+                }
+            };
+
+            // Start status animation interval
+            statusInterval = setInterval(() => updateMessage(), 800);
+
+            const onText = (text) => {
+                streamBlocks.push({ type: 'text', content: text });
+                updateMessage();
+            };
+            const onThinking = (think) => {
+                currentStatus = 'Thinking...';
+                streamBlocks.push({ type: 'thinking', content: think });
+                updateMessage();
+            };
+            const onTool = (tool) => {
+                // Detect AskUserQuestion and store for separate handling
+                if (tool.name === 'AskUserQuestion' && tool.input && tool.input.questions) {
+                    pendingQuestion = tool.input;
+                }
+                // Use human-readable status if available, otherwise show tool name
+                currentStatus = tool.status || `Using ${tool.name}`;
+                streamBlocks.push({ type: 'tool', content: tool.status || tool.name });
+                updateMessage();
+            };
+
+            // Listen for status updates too
+            const onStatus = (status) => {
+                currentStatus = status;
+                updateMessage();
+            };
+
+            session.on('text', onText);
+            session.on('thinking', onThinking);
+            session.on('tool_use', onTool);
+            session.on('status', onStatus);
+
+            try {
+                const result = await session.send(contentArray);
+
+                // Final Update - use streamBlocks for both modes
+                const mode = getDisplayMode(message.author.id);
+                const formatted = formatStructuredOutput(streamBlocks, mode);
+                const chunks = splitMessage(formatted);
+                if (chunks.length > 0) {
+                    await replyMessage.edit(chunks[0]);
+                    for (let i = 1; i < chunks.length; i++) {
+                        await message.channel.send(chunks[i]);
+                    }
+                }
+
+                // If there was an AskUserQuestion, send it as a new message
+                if (pendingQuestion && pendingQuestion.questions) {
+                    const questionEmbed = new EmbedBuilder()
+                        .setColor(0x5865F2)
+                        .setTitle('🤔 Claude needs your input');
+
+                    let desc = '';
+                    for (const q of pendingQuestion.questions) {
+                        desc += `**${q.header || 'Question'}:** ${q.question}\n`;
+                        if (q.options && q.options.length > 0) {
+                            for (const opt of q.options) {
+                                desc += `  • **${opt.label}** - ${opt.description || ''}\n`;
+                            }
+                        }
+                        desc += '\n';
+                    }
+
+                    questionEmbed.setDescription(desc.trim());
+                    questionEmbed.setFooter({ text: 'Reply with your choice to continue' });
+                    await message.channel.send({ embeds: [questionEmbed] });
+                }
+
+                // Update DB
+                const dbSession = getActiveSession(message.channel.id, message.author.id);
+                if (dbSession) {
+                    addMessage(dbSession.id, 'user', message.content);
+                    addMessage(dbSession.id, 'assistant', result.output);
+                    updateSessionTimestamp(dbSession.id);
+                }
+
+            } catch (error) {
+                console.error('Error processing message:', error);
+                await replyMessage.edit(formatError(error));
+            } finally {
+                // Stop animation and clean up listeners
+                clearInterval(statusInterval);
+                session.off('text', onText);
+                session.off('thinking', onThinking);
+                session.off('tool_use', onTool);
+                session.off('status', onStatus);
+            }
+
         } catch (error) {
-            await message.reactions.removeAll().catch(() => {});
-            await message.reply(formatError(error));
+            console.error('Fatal error:', error);
+            await message.channel.send(formatError(error));
         }
     }
 }

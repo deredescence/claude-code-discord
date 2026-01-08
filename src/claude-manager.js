@@ -1,298 +1,339 @@
 /**
- * Claude Code Process Manager (PTY Version)
+ * Claude Code Process Manager (JSON Streaming version)
  *
- * Uses node-pty for true interactive mode - persistent sessions,
- * real-time streaming, thinking display, the works.
+ * Uses child_process spawn with --input-format stream-json --output-format stream-json
+ * for true bidirectional streaming with Claude Code.
  */
 
-import pty from 'node-pty';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
-import { cleanOutput, isWaitingForInput, isThinking } from './utils/formatter.js';
 
-const CLAUDE_PATH = process.env.CLAUDE_PATH || 'claude';
-const SHELL = process.platform === 'win32' ? 'powershell.exe' : 'bash';
+// On Windows, use claude.cmd explicitly
+const isWindows = process.platform === 'win32';
+const CLAUDE_PATH = process.env.CLAUDE_PATH || (isWindows ? 'claude.cmd' : 'claude');
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || null;
 
 /**
- * Interactive Claude Code session using PTY
+ * Interactive Claude Code session with JSON streaming
  */
 export class ClaudeSession extends EventEmitter {
     constructor(options = {}) {
         super();
-        this.pty = null;
         this.sessionId = options.sessionId || null;
         this.workingDir = options.workingDir || process.cwd();
-        this.isRunning = false;
-        this.isReady = false;
-        this.outputBuffer = '';
+        this.timeout = options.timeout || 300000; // 5 min per message
+        this.process = null;
+        this.isProcessing = false;
         this.pendingResolve = null;
-        this.lastActivity = Date.now();
-
-        // Output buffering for Discord
-        this.discordBuffer = '';
-        this.bufferTimeout = null;
-        this.BUFFER_DELAY = 500; // ms to wait before sending to Discord
+        this.pendingReject = null;
+        this.currentOutput = '';
+        this.timeoutId = null;
     }
 
     /**
-     * Start interactive Claude Code session
-     */
-    start() {
-        const args = ['--dangerously-skip-permissions'];
-
-        // Resume if we have a session ID
-        if (this.sessionId) {
-            args.push('--resume', this.sessionId);
-        }
-
-        // Spawn PTY
-        this.pty = pty.spawn(CLAUDE_PATH, args, {
-            name: 'xterm-256color',
-            cols: 120,
-            rows: 40,
-            cwd: this.workingDir,
-            env: {
-                ...process.env,
-                FORCE_COLOR: '1',
-                TERM: 'xterm-256color'
-            }
-        });
-
-        this.isRunning = true;
-        this.setupListeners();
-
-        return this;
-    }
-
-    /**
-     * Send input to Claude
-     */
-    write(input) {
-        if (!this.pty || !this.isRunning) {
-            throw new Error('Session not running');
-        }
-
-        this.lastActivity = Date.now();
-        this.isReady = false;
-        this.pty.write(input + '\r');
-    }
-
-    /**
-     * Send a message and wait for response
+     * Send a message to Claude and stream the response
+     * @param {string | Array} message - Text string or content array with text/image blocks
      */
     async send(message) {
-        return new Promise((resolve, reject) => {
-            if (!this.isReady && this.isRunning) {
-                // Wait for ready state
-                const readyHandler = () => {
-                    this.removeListener('ready', readyHandler);
-                    this.doSend(message, resolve, reject);
-                };
-                this.once('ready', readyHandler);
+        if (this.isProcessing) {
+            throw new Error('Already processing a message. Please wait.');
+        }
 
-                // Timeout after 30s
-                setTimeout(() => {
-                    this.removeListener('ready', readyHandler);
-                    reject(new Error('Timeout waiting for Claude to be ready'));
-                }, 30000);
-            } else {
-                this.doSend(message, resolve, reject);
+        return new Promise((resolve, reject) => {
+            this.isProcessing = true;
+            this.pendingResolve = resolve;
+            this.pendingReject = reject;
+            this.currentOutput = '';
+
+            const args = [
+                '-p',
+                '--input-format', 'stream-json',
+                '--output-format', 'stream-json'
+            ];
+
+            // Add model if specified
+            if (CLAUDE_MODEL) {
+                args.push('--model', CLAUDE_MODEL);
             }
+
+            // Resume session if we have one
+            if (this.sessionId) {
+                args.push('--resume', this.sessionId);
+            }
+
+            // Spawn Claude
+            this.process = spawn(CLAUDE_PATH, args, {
+                cwd: this.workingDir,
+                shell: isWindows,
+                windowsHide: true,
+                env: {
+                    ...process.env,
+                    FORCE_COLOR: '0',
+                    NO_COLOR: '1'
+                }
+            });
+
+            let buffer = '';
+
+            this.process.stdout.on('data', (data) => {
+                buffer += data.toString();
+
+                // Process complete JSON lines
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+                for (const line of lines) {
+                    if (line.trim()) {
+                        this.handleJsonLine(line.trim());
+                    }
+                }
+            });
+
+            this.process.stderr.on('data', (data) => {
+                const text = data.toString();
+                this.emit('stderr', text);
+            });
+
+            this.process.on('close', (code) => {
+                this.isProcessing = false;
+                this.process = null;
+                clearTimeout(this.timeoutId);
+
+                if (this.pendingResolve) {
+                    this.pendingResolve({
+                        output: this.currentOutput,
+                        sessionId: this.sessionId
+                    });
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+            });
+
+            this.process.on('error', (err) => {
+                this.isProcessing = false;
+                this.process = null;
+                clearTimeout(this.timeoutId);
+
+                if (this.pendingReject) {
+                    this.pendingReject(err);
+                    this.pendingResolve = null;
+                    this.pendingReject = null;
+                }
+            });
+
+            // Timeout
+            this.timeoutId = setTimeout(() => {
+                if (this.process) {
+                    this.process.kill('SIGTERM');
+                    if (this.pendingReject) {
+                        this.pendingReject(new Error('Response timeout'));
+                        this.pendingResolve = null;
+                        this.pendingReject = null;
+                    }
+                }
+            }, this.timeout);
+
+            // Send the user message - handle both string and content array
+            const content = typeof message === 'string' ? message : message;
+            const inputMessage = JSON.stringify({
+                type: 'user',
+                message: {
+                    role: 'user',
+                    content: content
+                }
+            });
+
+            this.process.stdin.write(inputMessage + '\n');
+            this.process.stdin.end();
         });
     }
 
-    doSend(message, resolve, reject) {
-        this.outputBuffer = '';
-        this.pendingResolve = resolve;
-
-        // Set up response timeout
-        const timeout = setTimeout(() => {
-            this.pendingResolve = null;
-            reject(new Error('Response timeout'));
-        }, 300000); // 5 minute timeout
-
-        // Listen for completion
-        const completeHandler = () => {
-            clearTimeout(timeout);
-            this.pendingResolve = null;
-            this.removeListener('ready', completeHandler);
-            resolve(this.outputBuffer);
-        };
-
-        this.once('ready', completeHandler);
-        this.write(message);
-    }
-
     /**
-     * Execute a slash command (like /plugin)
+     * Handle a JSON line from Claude's output
      */
-    async command(cmd) {
-        return this.send(cmd);
-    }
+    handleJsonLine(line) {
+        try {
+            const data = JSON.parse(line);
 
-    /**
-     * Resize the PTY (if Discord somehow needs it)
-     */
-    resize(cols, rows) {
-        if (this.pty) {
-            this.pty.resize(cols, rows);
+            switch (data.type) {
+                case 'system':
+                    if (data.subtype === 'init') {
+                        // Session started
+                        if (data.session_id && !this.sessionId) {
+                            this.sessionId = data.session_id;
+                            this.emit('session', this.sessionId);
+                        }
+                        this.emit('init', data);
+                    }
+                    break;
+
+                case 'assistant':
+                    // Extract text content from message
+                    if (data.message && data.message.content) {
+                        for (const block of data.message.content) {
+                            if (block.type === 'text') {
+                                this.currentOutput += block.text;
+                                this.emit('text', block.text);
+                            } else if (block.type === 'thinking') {
+                                // Extended thinking content
+                                this.emit('thinking', block.thinking);
+                            } else if (block.type === 'tool_use') {
+                                // Emit detailed tool status
+                                const toolName = block.name || 'Tool';
+                                const toolInput = block.input || {};
+
+                                // Generate human-readable status
+                                let status = toolName;
+                                if (toolName === 'Read' && toolInput.file_path) {
+                                    status = `Reading ${this.shortenPath(toolInput.file_path)}`;
+                                } else if (toolName === 'Write' && toolInput.file_path) {
+                                    status = `Writing ${this.shortenPath(toolInput.file_path)}`;
+                                } else if (toolName === 'Edit' && toolInput.file_path) {
+                                    status = `Editing ${this.shortenPath(toolInput.file_path)}`;
+                                } else if (toolName === 'Bash' && toolInput.command) {
+                                    const cmd = toolInput.command.substring(0, 30);
+                                    status = `Running: ${cmd}${toolInput.command.length > 30 ? '...' : ''}`;
+                                } else if (toolName === 'Grep' || toolName === 'Glob') {
+                                    status = `Searching...`;
+                                } else if (toolName === 'WebFetch') {
+                                    status = `Fetching web content`;
+                                } else if (toolName === 'Task') {
+                                    status = `Spawning agent...`;
+                                }
+
+                                this.emit('tool_use', { name: toolName, input: toolInput, status });
+                                this.emit('status', status);
+                            }
+                        }
+                    }
+                    // Capture session ID
+                    if (data.session_id && !this.sessionId) {
+                        this.sessionId = data.session_id;
+                        this.emit('session', this.sessionId);
+                    }
+                    break;
+
+                case 'content_block_start':
+                    // Tool is starting
+                    if (data.content_block && data.content_block.type === 'tool_use') {
+                        const toolName = data.content_block.name;
+                        this.emit('status', `Using ${toolName}...`);
+                    } else if (data.content_block && data.content_block.type === 'thinking') {
+                        this.emit('status', 'Thinking...');
+                    }
+                    break;
+
+                case 'content_block_delta':
+                    // Streaming content
+                    if (data.delta) {
+                        if (data.delta.type === 'thinking_delta' && data.delta.thinking) {
+                            this.emit('thinking', data.delta.thinking);
+                        } else if (data.delta.type === 'text_delta' && data.delta.text) {
+                            this.currentOutput += data.delta.text;
+                            this.emit('text', data.delta.text);
+                        }
+                    }
+                    break;
+
+                case 'result':
+                    // Final result
+                    if (data.result) {
+                        this.currentOutput = data.result; // Use final result
+                    }
+                    if (data.session_id) {
+                        this.sessionId = data.session_id;
+                    }
+                    this.emit('result', data);
+                    break;
+
+                default:
+                    this.emit('event', data);
+            }
+        } catch (e) {
+            this.emit('parse_error', { line, error: e.message });
         }
     }
 
     /**
-     * Kill the session
+     * Shorten a file path for display
+     */
+    shortenPath(path) {
+        if (!path) return '';
+        const parts = path.replace(/\\/g, '/').split('/');
+        if (parts.length > 2) {
+            return '.../' + parts.slice(-2).join('/');
+        }
+        return path;
+    }
+
+    /**
+     * Kill the current process
      */
     kill() {
-        if (this.pty) {
-            this.pty.kill();
-            this.pty = null;
+        if (this.process) {
+            this.process.kill('SIGTERM');
+            this.process = null;
         }
-        this.isRunning = false;
-        this.isReady = false;
-        this.emit('close', 0);
-    }
-
-    /**
-     * Graceful exit - send /exit command first
-     */
-    async exit() {
-        try {
-            this.write('/exit\r');
-            await new Promise(resolve => setTimeout(resolve, 1000));
-        } catch (e) {
-            // Ignore
-        }
-        this.kill();
-    }
-
-    setupListeners() {
-        this.pty.onData((data) => {
-            this.lastActivity = Date.now();
-            const cleaned = cleanOutput(data);
-
-            // Accumulate output
-            this.outputBuffer += cleaned;
-
-            // Buffer for Discord (don't spam)
-            this.discordBuffer += cleaned;
-            this.scheduleDiscordEmit();
-
-            // Emit raw for debugging
-            this.emit('data', data);
-
-            // Check for session ID in output
-            const sessionMatch = data.match(/Session:\s*([a-f0-9-]+)/i) ||
-                                 data.match(/session[:\s]+([a-f0-9-]+)/i);
-            if (sessionMatch && !this.sessionId) {
-                this.sessionId = sessionMatch[1];
-                this.emit('session', this.sessionId);
-            }
-
-            // Check if Claude is thinking
-            if (isThinking(cleaned)) {
-                this.emit('thinking', cleaned);
-            }
-
-            // Check if ready for input
-            if (isWaitingForInput(data)) {
-                this.isReady = true;
-                this.emit('ready');
-
-                // Flush any remaining buffer
-                if (this.discordBuffer.trim()) {
-                    this.emit('output', this.discordBuffer);
-                    this.discordBuffer = '';
-                }
-            }
-        });
-
-        this.pty.onExit(({ exitCode }) => {
-            this.isRunning = false;
-            this.isReady = false;
-            this.emit('close', exitCode);
-        });
-    }
-
-    scheduleDiscordEmit() {
-        // Debounce Discord output
-        if (this.bufferTimeout) {
-            clearTimeout(this.bufferTimeout);
-        }
-
-        this.bufferTimeout = setTimeout(() => {
-            if (this.discordBuffer.trim()) {
-                this.emit('output', this.discordBuffer);
-                this.discordBuffer = '';
-            }
-        }, this.BUFFER_DELAY);
+        this.isProcessing = false;
+        clearTimeout(this.timeoutId);
     }
 }
 
-// Active sessions: channelId_userId -> ClaudeSession
-const activeSessions = new Map();
+// Active sessions: key -> ClaudeSession
+const sessions = new Map();
 
 /**
- * Get or create a session for a channel/user
+ * Get or create session for channel/user
  */
 export function getOrCreateSession(channelId, userId, options = {}) {
     const key = `${channelId}_${userId}`;
 
-    let session = activeSessions.get(key);
+    let session = sessions.get(key);
 
-    if (!session || !session.isRunning) {
+    if (!session) {
         session = new ClaudeSession({
             sessionId: options.sessionId,
             workingDir: options.workingDir
         });
-        session.start();
-        activeSessions.set(key, session);
+        sessions.set(key, session);
+    } else {
+        // Update session ID if provided
+        if (options.sessionId) {
+            session.sessionId = options.sessionId;
+        }
+        if (options.workingDir) {
+            session.workingDir = options.workingDir;
+        }
     }
 
     return session;
 }
 
 /**
- * Get existing session (don't create)
+ * Get existing session
  */
 export function getSession(channelId, userId) {
-    return activeSessions.get(`${channelId}_${userId}`);
+    return sessions.get(`${channelId}_${userId}`);
 }
 
 /**
- * Kill and remove a session
+ * Remove session
  */
-export function killSession(channelId, userId) {
+export function removeSession(channelId, userId) {
     const key = `${channelId}_${userId}`;
-    const session = activeSessions.get(key);
+    const session = sessions.get(key);
 
     if (session) {
         session.kill();
-        activeSessions.delete(key);
-        return true;
     }
-    return false;
+
+    sessions.delete(key);
+    return !!session;
 }
 
 /**
- * Get all active sessions
+ * Get all sessions
  */
 export function getAllSessions() {
-    return activeSessions;
+    return sessions;
 }
-
-/**
- * Clean up stale sessions (no activity for > 30 min)
- */
-export function cleanupStaleSessions() {
-    const STALE_THRESHOLD = 30 * 60 * 1000; // 30 minutes
-    const now = Date.now();
-
-    for (const [key, session] of activeSessions) {
-        if (now - session.lastActivity > STALE_THRESHOLD) {
-            session.kill();
-            activeSessions.delete(key);
-        }
-    }
-}
-
-// Run cleanup every 5 minutes
-setInterval(cleanupStaleSessions, 5 * 60 * 1000);

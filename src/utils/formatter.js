@@ -6,11 +6,10 @@
 import stripAnsi from 'strip-ansi';
 
 const MAX_MESSAGE_LENGTH = 2000;
-const MAX_EMBED_LENGTH = 4096;
 const CODE_BLOCK_OVERHEAD = 8; // ```\n...\n```
 
 /**
- * Strip ANSI codes and clean terminal output
+ * Strip ANSI codes, internal markers, and clean terminal output
  */
 export function cleanOutput(text) {
     if (!text) return '';
@@ -20,6 +19,18 @@ export function cleanOutput(text) {
 
     // Remove carriage returns and normalize line endings
     cleaned = cleaned.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+    // Remove <thinking>...</thinking> blocks (including multiline)
+    cleaned = cleaned.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+
+    // Remove orphaned <thinking> or </thinking> tags
+    cleaned = cleaned.replace(/<\/?thinking>/gi, '');
+
+    // Remove <...> tags (internal Anthropic markers)
+    cleaned = cleaned.replace(/<\/?antml:[^>]*>/gi, '');
+
+    // Remove system-reminder blocks
+    cleaned = cleaned.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, '');
 
     // Remove excessive blank lines
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
@@ -65,33 +76,61 @@ export function splitMessage(content, maxLength = MAX_MESSAGE_LENGTH) {
 }
 
 /**
- * Format tool output (file reads, bash commands, etc.)
+ * Format structured stream blocks for display
+ * @param {Array<{type: string, content: string}>} blocks
+ * @param {string} mode 'raw' or 'clean'
  */
-export function formatToolOutput(toolName, output) {
-    const cleaned = cleanOutput(output);
-    const maxContent = MAX_MESSAGE_LENGTH - CODE_BLOCK_OVERHEAD - toolName.length - 10;
-
-    if (cleaned.length > maxContent) {
-        const truncated = cleaned.substring(0, maxContent - 20) + '\n... (truncated)';
-        return `**${toolName}**\n\`\`\`\n${truncated}\n\`\`\``;
+export function formatStructuredOutput(blocks, mode = 'raw') {
+    if (mode === 'clean') {
+        // Only return text content
+        return blocks
+            .filter(b => b.type === 'text')
+            .map(b => cleanOutput(b.content))
+            .join('') || '*(Processing...)*';
     }
 
-    return `**${toolName}**\n\`\`\`\n${cleaned}\n\`\`\``;
+    // Raw mode: Show everything with Discord subheaders (-#)
+    let output = '';
+    let lastType = null;
+
+    for (const block of blocks) {
+        const cleaned = cleanOutput(block.content);
+        if (!cleaned) continue;
+
+        switch (block.type) {
+            case 'thinking':
+                // Small text for thinking - each on its own line
+                if (lastType && lastType !== 'thinking') output += '\n';
+                output += `-# 💭 ${cleaned.substring(0, 150)}${cleaned.length > 150 ? '...' : ''}\n`;
+                break;
+
+            case 'tool':
+                // Small text for tool use - each on its own line
+                if (lastType && lastType !== 'tool') output += '\n';
+                output += `-# ⚙️ ${cleaned}\n`;
+                break;
+
+            case 'text':
+            default:
+                // Normal text - add spacing if coming from status lines
+                if (lastType === 'thinking' || lastType === 'tool') output += '\n';
+                output += cleaned;
+                break;
+        }
+        lastType = block.type;
+    }
+
+    return output || '*(Processing...)*';
 }
 
 /**
- * Format Claude's text response
+ * Format response with spoilers for code blocks
  */
-export function formatResponse(text) {
-    const cleaned = cleanOutput(text);
+export function formatResponseSmart(text) {
+    let cleaned = cleanOutput(text);
+    // Wrap code blocks in spoilers
+    cleaned = cleaned.replace(/(```[\s\S]*?```)/g, '||$1||');
     return splitMessage(cleaned);
-}
-
-/**
- * Format progress/status updates
- */
-export function formatStatus(status, emoji = '⏳') {
-    return `${emoji} ${status}`;
 }
 
 /**
@@ -106,7 +145,6 @@ export function formatError(error) {
  * Parse Claude Code output to extract session ID
  */
 export function extractSessionId(output) {
-    // Claude Code outputs session ID in various formats
     const patterns = [
         /session[:\s]+([a-f0-9-]+)/i,
         /resuming[:\s]+([a-f0-9-]+)/i,
@@ -119,39 +157,5 @@ export function extractSessionId(output) {
             return match[1];
         }
     }
-
     return null;
-}
-
-/**
- * Detect if output indicates Claude is waiting for input
- */
-export function isWaitingForInput(output) {
-    const indicators = [
-        '> ', // Standard prompt
-        '? ', // Question prompt
-        'Enter your message',
-        'Type your response',
-        'waiting for input'
-    ];
-
-    const cleaned = cleanOutput(output);
-    const lastLine = cleaned.split('\n').pop()?.trim() || '';
-
-    return indicators.some(ind => lastLine.includes(ind) || lastLine.endsWith(ind));
-}
-
-/**
- * Detect thinking/processing indicators
- */
-export function isThinking(output) {
-    const indicators = [
-        'Thinking...',
-        'Processing...',
-        '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏', // Spinner chars
-        '...'
-    ];
-
-    const cleaned = cleanOutput(output);
-    return indicators.some(ind => cleaned.includes(ind));
 }
